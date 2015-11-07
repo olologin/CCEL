@@ -107,6 +107,8 @@ class BaseCCEL(with_metaclass(ABCMeta, BaseEnsemble)):
                  min_features=0.25,
                  bootstrap=True,
                  bootstrap_features=False,
+                 compute_population_predictions = None,
+                 get_estimator_fitness_func = None,
                  random_state=None,
                  verbose=0):
         super(BaseCCEL, self).__init__(
@@ -136,6 +138,8 @@ class BaseCCEL(with_metaclass(ABCMeta, BaseEnsemble)):
         self.bootstrap_features = bootstrap_features
         self.random_state = random_state
         self.verbose = verbose
+        self.compute_population_predictions = compute_population_predictions
+        self.get_estimator_fitness_func = get_estimator_fitness_func
 
     def fit(self, X, y, sample_weight=None):
         random_state = check_random_state(self.random_state)
@@ -186,33 +190,14 @@ class BaseCCEL(with_metaclass(ABCMeta, BaseEnsemble)):
         _offsprings = [Organizm(n_samples, self.n_features_, self.ps, self.pf, random_state) for _ in range(self.N1)]
 
         def _append_population():
-            idx = len(_populations)
             population = [Organizm(n_samples, self.n_features_, self.ps, self.pf, random_state) for _ in range(self.N0)]
             _populations.append(population)
             _contributions.append(np.arange(self.d1, dtype=float))
-            _compute_cache_predictions(population)
+            self.compute_population_predictions(X, y, sample_weight, _estimator, population)
 
         def _remove_population(idx):
             del _populations[idx]
             del _contributions[idx]
-
-        def _compute_cache_predictions(population):
-            #_score(self, Y, n_estimators, sample_weights=None, est_weights=None):
-            for organizm in population:
-                _estimator.random_state = organizm.random_state
-                if support_sample_weight:
-                    _estimator.fit(X[organizm.genome_samples,:][:,organizm.genome_features],
-                                          y[organizm.genome_samples], sample_weight[organizm.genome_samples] if sample_weight is not None else None)
-                else:
-                    _estimator.fit(X[organizm.genome_samples,:][:,organizm.genome_features],
-                                          y[organizm.genome_samples])
-                if support_predict_proba:
-                    organizm.cache_predictions = _estimator.predict_proba(X[:, organizm.genome_features])
-                else:
-                    organizm.cache_predictions = np.zeros((n_samples, len(_estimator.classes_)))
-                    predictions = _estimator.predict(X[:, organizm.genome_features])
-                    for i in range(n_samples):
-                        organizm.cache_predictions[i, predictions[i]] += 1
 
         def _compute_cache_accuracy_contribution(fitness_func, population):
             accuracy_without_target = fitness_func()
@@ -241,13 +226,14 @@ class BaseCCEL(with_metaclass(ABCMeta, BaseEnsemble)):
                     y,
                     sample_weight)
                 # crossover
+                _compute_cache_accuracy_contribution(fitness_func, population)
+
                 choices = genchoices()
                 for offspring, (first, second) in zip(_offsprings, choices):
                     offspring.crossover(population[first], population[second])
                     offspring.mutation(self.pm)
 
-                _compute_cache_accuracy_contribution(fitness_func, population)
-                _compute_cache_predictions(_offsprings)
+                self.compute_population_predictions(X, y, sample_weight, _estimator, _offsprings)
                 _compute_cache_accuracy_contribution(fitness_func, _offsprings)
                 population.sort(reverse=True, key=lambda x:x.cache_accuracy)
                 a = sorted(population[:self.N2] + _offsprings, reverse=True, key=lambda x:x.cache_accuracy)
@@ -298,9 +284,52 @@ class BaseCCEL(with_metaclass(ABCMeta, BaseEnsemble)):
         # Default implementation
         return column_or_1d(y, warn=True)
 
-    @abstractmethod
-    def get_estimator_fitness_func(self, ensemble_without_estimator, y_true, sample_weight=None):
-        """Returns score from precomputed results of each estimator"""
+    # TODO Minimum features and minimum samples treating
+    # TODO classifier weighting
+    # Parallelization
+    # Less parameters
+    # max optimization
+
+
+def compute_cache_classifier_predictions(X, y, sample_weights, estimator, population):
+    support_predict_proba = hasattr(estimator, "predict_proba")
+    support_sample_weight = has_fit_parameter(estimator,
+                                          "sample_weight")
+    for organizm in population:
+        estimator.random_state = organizm.random_state
+        if sample_weights and support_sample_weight:
+            estimator.fit(X[organizm.genome_samples,:][:,organizm.genome_features],
+                           y[organizm.genome_samples], sample_weights[organizm.genome_samples])
+        else:
+            estimator.fit(X[organizm.genome_samples,:][:,organizm.genome_features],
+                           y[organizm.genome_samples])
+        if support_predict_proba:
+            organizm.cache_predictions = estimator.predict_proba(X[:, organizm.genome_features])
+        else:
+            predictions = estimator.predict(X[:, organizm.genome_features])
+            organizm.cache_predictions = np.zeros((predictions.shape[0], len(estimator.classes_)))
+            for i in range(predictions.shape[0]):
+                organizm.cache_predictions[i, predictions[i]] += 1
+
+
+def get_classifier_fitness_func(ensemble_without_estimator, y_true, sample_weight=None):
+    Y = np.sum(o.cache_est_weight * o.cache_predictions for o in ensemble_without_estimator)
+
+    def fitness_func(organizm = None):
+        if organizm == None:
+            if np.shape(Y) == ():
+                return 0
+
+            ensemble_y = np.argmax(Y, axis=1)
+            return accuracy_score(y_true, ensemble_y, sample_weight=sample_weight,
+                                  normalize=True)
+
+        Z = Y + (organizm.cache_est_weight * organizm.cache_predictions)
+        ensemble_y = np.argmax(Z, axis=1)
+        return accuracy_score(y_true, ensemble_y, sample_weight=sample_weight,
+                              normalize=True)
+    return fitness_func
+
 
 
 class CCELClassifier(BaseCCEL, ClassifierMixin):
@@ -347,6 +376,8 @@ class CCELClassifier(BaseCCEL, ClassifierMixin):
                 min_features,
                 bootstrap,
                 bootstrap_features,
+                compute_cache_classifier_predictions,
+                get_classifier_fitness_func,
                 random_state,
                 verbose)
 
@@ -402,24 +433,6 @@ class CCELClassifier(BaseCCEL, ClassifierMixin):
         proba = all_proba / self.n_estimators
 
         return proba
-
-    def get_estimator_fitness_func(self, ensemble_without_estimator, y_true, sample_weight=None):
-        Y = np.sum(o.cache_est_weight * o.cache_predictions for o in ensemble_without_estimator)
-
-        def fitness_func(estimator = None):
-            if estimator == None:
-                if np.shape(Y) == ():
-                    return 0
-
-                ensemble_y = self.classes_.take((np.argmax(Y, axis=1)), axis=0)
-                return accuracy_score(y_true, ensemble_y, sample_weight=sample_weight,
-                                      normalize=True)
-
-            Z = Y + (estimator.cache_est_weight * estimator.cache_predictions)
-            ensemble_y = self.classes_.take((np.argmax(Z, axis=1)), axis=0)
-            return accuracy_score(y_true, ensemble_y, sample_weight=sample_weight,
-                                  normalize=True)
-        return fitness_func
 
 
 
