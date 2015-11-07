@@ -7,8 +7,8 @@ import numpy as np
 from abc import ABCMeta, abstractmethod
 
 from sklearn.base import ClassifierMixin
-from sklearn.ensemble.bagging import BaggingClassifier
 from sklearn.externals.six import with_metaclass
+from sklearn.externals.joblib import Parallel, delayed
 from sklearn.metrics import r2_score, accuracy_score
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 from sklearn.utils import check_random_state, check_X_y, check_array, column_or_1d
@@ -140,6 +140,7 @@ class BaseCCEL(with_metaclass(ABCMeta, BaseEnsemble)):
         self.verbose = verbose
         self.compute_population_predictions = compute_population_predictions
         self.get_estimator_fitness_func = get_estimator_fitness_func
+        self.n_jobs = 4
 
     def fit(self, X, y, sample_weight=None):
         random_state = check_random_state(self.random_state)
@@ -186,24 +187,18 @@ class BaseCCEL(with_metaclass(ABCMeta, BaseEnsemble)):
         _best_organizms = []
         _populations = []
         _contributions = []
-        _estimator = self._make_estimator(append=False)
+        _estimators = [self._make_estimator(append=False) for _ in range(self.n_jobs)]
         _offsprings = [Organizm(n_samples, self.n_features_, self.ps, self.pf, random_state) for _ in range(self.N1)]
 
         def _append_population():
             population = [Organizm(n_samples, self.n_features_, self.ps, self.pf, random_state) for _ in range(self.N0)]
             _populations.append(population)
             _contributions.append(np.arange(self.d1, dtype=float))
-            self.compute_population_predictions(X, y, sample_weight, _estimator, population)
+            self.compute_population_predictions(X, y, sample_weight, _estimators[0], population)
 
         def _remove_population(idx):
             del _populations[idx]
             del _contributions[idx]
-
-        def _compute_cache_accuracy_contribution(fitness_func, population):
-            accuracy_without_target = fitness_func()
-            for organizm in population:
-                organizm.cache_accuracy = fitness_func(organizm)
-                organizm.cache_contribution = organizm.cache_accuracy-accuracy_without_target
 
         def genchoices():
             res = set()
@@ -211,57 +206,68 @@ class BaseCCEL(with_metaclass(ABCMeta, BaseEnsemble)):
                 first = random_state.randint(0, self.N0-1)
                 second = random_state.randint(first+1, self.N0)
                 res.add((first, second))
-            return res
+            return list(res)
 
         for _ in range(self.min_estimators):
             _append_population()
 
-        for generation in range(self.tmax):
-            idx = 0
-            print("Generation #{0}".format(generation))
-            while idx < len(_populations):
-                population = _populations[idx]
-                fitness_func = self.get_estimator_fitness_func(
-                    [o[0] for i, o in enumerate(_populations) if i != idx],
-                    y,
-                    sample_weight)
-                # crossover
-                _compute_cache_accuracy_contribution(fitness_func, population)
+        step_N0 = int(self.N0 / self.n_jobs)
+        step_N1 = int(self.N1 / self.n_jobs)
+        with Parallel(n_jobs=self.n_jobs, backend="threading") as parallel:
 
-                choices = genchoices()
-                for offspring, (first, second) in zip(_offsprings, choices):
-                    offspring.crossover(population[first], population[second])
-                    offspring.mutation(self.pm)
+            for generation in range(self.tmax):
+                idx = 0
+                print("Generation #{0}".format(generation))
+                while idx < len(_populations):
+                    population = _populations[idx]
+                    fitness_func = self.get_estimator_fitness_func(
+                        [o[0] for i, o in enumerate(_populations) if i != idx],
+                        y,
+                        sample_weight)
+                    # crossover
+                    parallel(delayed(_compute_cache_accuracy_contribution)(fitness_func, population[idx:idx+step_N0])
+                             for idx in range(0, self.N0, step_N0))
 
-                self.compute_population_predictions(X, y, sample_weight, _estimator, _offsprings)
-                _compute_cache_accuracy_contribution(fitness_func, _offsprings)
-                population.sort(reverse=True, key=lambda x:x.cache_accuracy)
-                a = sorted(population[:self.N2] + _offsprings, reverse=True, key=lambda x:x.cache_accuracy)
-                dead = population[self.N2:]
-                _populations[idx] = a[:self.N0]
-                _offsprings = dead+a[self.N0:]
-                accuracy_per_generation[generation] = max(accuracy_per_generation[generation],
-                                                             a[0].cache_accuracy)
-                print("Estimator #{0} from {1}, accuracy {2}, contribution {3}".format(idx, len(_populations), a[0].cache_accuracy, a[0].cache_contribution))
-                _contributions[idx][generation%self.d1] = a[0].cache_contribution
+                    choices = genchoices()
+                    # compute_population_predictions, pm, fitness_func, X, y, sample_weight, estimator, choices, population, offsprings
+                    parallel(delayed(_offspring_routines)(self.compute_population_predictions,
+                                                          self.pm,
+                                                          fitness_func,
+                                                          X,
+                                                          y,
+                                                          sample_weight,
+                                                          _estimators[int(idx/step_N1)],
+                                                          choices[idx:idx+step_N1],
+                                                          population,
+                                                          _offsprings[idx:idx+step_N1])
+                             for idx in range(0, self.N1, step_N1))
+                    population.sort(reverse=True, key=lambda x:x.cache_accuracy)
+                    a = sorted(population[:self.N2] + _offsprings, reverse=True, key=lambda x:x.cache_accuracy)
+                    dead = population[self.N2:]
+                    _populations[idx] = a[:self.N0]
+                    _offsprings = dead+a[self.N0:]
+                    accuracy_per_generation[generation] = max(accuracy_per_generation[generation],
+                                                                 a[0].cache_accuracy)
+                    print("Estimator #{0} from {1}, accuracy {2}, contribution {3}".format(idx, len(_populations), a[0].cache_accuracy, a[0].cache_contribution))
+                    _contributions[idx][generation%self.d1] = a[0].cache_contribution
 
-                if len(_populations) > self.min_estimators and _contributions[idx].mean() < self.eps1:
-                    print("Estimator #{0} removed, contribution was {1}".format(idx, _contributions[idx].mean()))
-                    _remove_population(idx)
-                else:
-                    idx += 1
+                    if len(_populations) > self.min_estimators and _contributions[idx].mean() < self.eps1:
+                        print("Estimator #{0} removed, contribution was {1}".format(idx, _contributions[idx].mean()))
+                        _remove_population(idx)
+                    else:
+                        idx += 1
 
-            if (generation-self.d3-1 >=0 and
-                        (accuracy_per_generation[generation-self.d2:generation].max() -
-                             accuracy_per_generation[:generation-self.d3].max()) < self.eps3):
-                print("Seems that adding new population doesn't helps, stopping...")
-                break
+                if (generation-self.d3-1 >=0 and
+                            (accuracy_per_generation[generation-self.d2:generation].max() -
+                                 accuracy_per_generation[:generation-self.d3].max()) < self.eps3):
+                    print("Seems that adding new population doesn't helps, stopping...")
+                    break
 
-            if (generation-self.d2-1 >=0 and
-                        (accuracy_per_generation[generation-self.d2:generation].max() -
-                             accuracy_per_generation[:generation-self.d2].max())  < self.eps2):
-                _append_population()
-                print("Stagnation, let's add new population")
+                if (generation-self.d2-1 >=0 and
+                            (accuracy_per_generation[generation-self.d2:generation].max() -
+                                 accuracy_per_generation[:generation-self.d2].max())  < self.eps2):
+                    _append_population()
+                    print("Stagnation, let's add new population")
 
 
         self.estimators_ = []
@@ -289,6 +295,20 @@ class BaseCCEL(with_metaclass(ABCMeta, BaseEnsemble)):
     # Parallelization
     # Less parameters
     # max optimization
+
+def _compute_cache_accuracy_contribution(fitness_func, population):
+    accuracy_without_target = fitness_func()
+    for organizm in population:
+        organizm.cache_accuracy = fitness_func(organizm)
+        organizm.cache_contribution = organizm.cache_accuracy-accuracy_without_target
+
+
+def _offspring_routines(compute_population_predictions, pm, fitness_func, X, y, sample_weight, estimator, choices, population, offsprings):
+    for offspring, (first, second) in zip(offsprings, choices):
+        offspring.crossover(population[first], population[second])
+        offspring.mutation(pm)
+    compute_population_predictions(X, y, sample_weight, estimator, offsprings)
+    _compute_cache_accuracy_contribution(fitness_func, offsprings)
 
 
 def compute_cache_classifier_predictions(X, y, sample_weights, estimator, population):
