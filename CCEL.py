@@ -75,10 +75,6 @@ class Organizm:
                                                           np.floor(features_difference_idx.shape[0]/2), replace=False)
             self.genome_features[features_inherited] = True
 
-"""class Population():
-    def __init__(self, N0, N1, N2, ):
-"""
-
 class BaseCCEL(with_metaclass(ABCMeta, BaseEnsemble)):
     """Base class for CCEL meta-estimator.
 
@@ -140,7 +136,7 @@ class BaseCCEL(with_metaclass(ABCMeta, BaseEnsemble)):
         self.verbose = verbose
         self.compute_population_predictions = compute_population_predictions
         self.get_estimator_fitness_func = get_estimator_fitness_func
-        self.n_jobs = 4
+        self.n_jobs = 2
 
     def fit(self, X, y, sample_weight=None):
         random_state = check_random_state(self.random_state)
@@ -188,10 +184,10 @@ class BaseCCEL(with_metaclass(ABCMeta, BaseEnsemble)):
         _populations = []
         _contributions = []
         _estimators = [self._make_estimator(append=False) for _ in range(self.n_jobs)]
-        _offsprings = [Organizm(n_samples, self.n_features_, self.ps, self.pf, random_state) for _ in range(self.N1)]
+        _offsprings = [Organizm(n_samples, self.n_features_, self.ps, self.pf, np.random.RandomState(random_state.randint(100))) for _ in range(self.N1)]
 
         def _append_population():
-            population = [Organizm(n_samples, self.n_features_, self.ps, self.pf, random_state) for _ in range(self.N0)]
+            population = [Organizm(n_samples, self.n_features_, self.ps, self.pf, np.random.RandomState(random_state.randint(100))) for _ in range(self.N0)]
             _populations.append(population)
             _contributions.append(np.arange(self.d1, dtype=float))
             self.compute_population_predictions(X, y, sample_weight, _estimators[0], population)
@@ -202,7 +198,7 @@ class BaseCCEL(with_metaclass(ABCMeta, BaseEnsemble)):
 
         def genchoices():
             res = set()
-            while len(res) <= self.N1:
+            while len(res) < self.N1:
                 first = random_state.randint(0, self.N0-1)
                 second = random_state.randint(first+1, self.N0)
                 res.add((first, second))
@@ -241,6 +237,7 @@ class BaseCCEL(with_metaclass(ABCMeta, BaseEnsemble)):
                                                           population,
                                                           _offsprings[idx:idx+step_N1])
                              for idx in range(0, self.N1, step_N1))
+
                     population.sort(reverse=True, key=lambda x:x.cache_accuracy)
                     a = sorted(population[:self.N2] + _offsprings, reverse=True, key=lambda x:x.cache_accuracy)
                     dead = population[self.N2:]
@@ -323,6 +320,7 @@ def compute_cache_classifier_predictions(X, y, sample_weights, estimator, popula
         else:
             estimator.fit(X[organizm.genome_samples,:][:,organizm.genome_features],
                            y[organizm.genome_samples])
+
         if support_predict_proba:
             organizm.cache_predictions = estimator.predict_proba(X[:, organizm.genome_features])
         else:
